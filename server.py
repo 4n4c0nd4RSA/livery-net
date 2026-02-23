@@ -6,6 +6,7 @@ import time
 import uuid
 import hashlib
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Tuple, Set
 
@@ -85,6 +86,72 @@ class SyncServer:
         self.SCHEDULER_TICK_SECONDS = 1.0         # periodic scheduler
         self.CONFLICT_SUFFIX = "__CONFLICT__"     # conflict marker
 
+        # Validation knobs
+        self.ALLOWED_EXTS: Set[str] = {".png", ".jpg", ".dds", ".json"}
+        self._sha256_re = re.compile(r"^[0-9a-fA-F]{64}$")
+
+    # -----------------------------
+    # Validation helpers
+    # -----------------------------
+    def _is_allowed_path(self, rel_path: str) -> bool:
+        if not isinstance(rel_path, str) or not rel_path:
+            return False
+        # normalize slashes; do not allow absolute paths
+        rp = rel_path.replace("\\", "/")
+        if rp.startswith("/") or rp.startswith("\\"):
+            return False
+        # simple traversal guard
+        if ".." in rp.split("/"):
+            return False
+        _base, ext = os.path.splitext(rp)
+        return ext.lower() in self.ALLOWED_EXTS
+
+    def _is_valid_sha256(self, sha256: str) -> bool:
+        if not isinstance(sha256, str) or not sha256:
+            return False
+        return bool(self._sha256_re.match(sha256))
+
+    def _sanitize_manifest(self, manifest: Any) -> List[Dict[str, Any]]:
+        """
+        Keep only entries that:
+          - have rel_path with allowed extension: .png .jpg .dds .json
+          - have sha256 that looks like 64 hex chars
+          - have size as int >= 0
+        """
+        if not isinstance(manifest, list):
+            return []
+
+        out: List[Dict[str, Any]] = []
+        for it in manifest:
+            if not isinstance(it, dict):
+                continue
+
+            rel = it.get("rel_path")
+            sh = it.get("sha256")
+            if not isinstance(rel, str) or not isinstance(sh, str):
+                continue
+
+            rel_norm = rel.replace("\\", "/").strip()
+            sh_norm = sh.strip()
+
+            if not self._is_allowed_path(rel_norm):
+                continue
+            if not self._is_valid_sha256(sh_norm):
+                continue
+
+            try:
+                size = int(it.get("size", 0))
+            except Exception:
+                continue
+            if size < 0:
+                continue
+
+            out.append({"rel_path": rel_norm, "sha256": sh_norm, "size": size})
+
+        # stable order (helps determinism)
+        out.sort(key=lambda x: (x["rel_path"], x["sha256"], x["size"]))
+        return out
+
     # -----------------------------
     # Utility: safe send
     # -----------------------------
@@ -144,8 +211,15 @@ class SyncServer:
                     continue
                 if not isinstance(sh, str) or not sh:
                     continue
+
+                reln = rel.replace("\\", "/")
+                if not self._is_allowed_path(reln):
+                    continue
+                if not self._is_valid_sha256(sh):
+                    continue
+
                 size = int(it.get("size", 0))
-                all_entries.append((cid, {"rel_path": rel.replace("\\", "/"), "sha256": sh, "size": size}))
+                all_entries.append((cid, {"rel_path": reln, "sha256": sh, "size": size}))
 
         # Union by rel_path, but keep conflicts by renaming later ones
         union_map: Dict[str, Dict[str, Any]] = {}
@@ -275,6 +349,9 @@ class SyncServer:
                 # Group missing by chosen source
                 per_source: Dict[str, List[str]] = {}
                 for rel in missing:
+                    # extension check before scheduling
+                    if not self._is_allowed_path(rel):
+                        continue
                     src = self._pick_source_for_path(rel, providers)
                     if not src:
                         continue
@@ -396,11 +473,12 @@ class SyncServer:
 
                 elif mtype == "MANIFEST_FULL":
                     manifest = msg.get("manifest")
-                    if not isinstance(manifest, list):
-                        continue
 
-                    # Store client's manifest
-                    conn.manifest_items = manifest
+                    # Filter manifest to only allowed extensions + valid sha256/size
+                    sanitized = self._sanitize_manifest(manifest)
+
+                    # Store client's sanitized manifest
+                    conn.manifest_items = sanitized
                     conn.manifest_items_at = time.time()
 
                     # Update summary hash if present
@@ -414,7 +492,7 @@ class SyncServer:
                             await self._safe_send(sess.target_id, {
                                 "type": "MANIFEST_FULL",
                                 "sync_id": sid,
-                                "manifest": manifest,
+                                "manifest": sanitized,
                             })
 
                     # After receiving manifest, attempt scheduling
@@ -428,6 +506,15 @@ class SyncServer:
                     # Relay only from SOURCE -> TARGET
                     if client_id != sess.source_id:
                         continue
+
+                    # Extension gate:
+                    # - If message carries a rel_path (expected on FILE_BEGIN/FILE_END), drop if invalid or not in session paths.
+                    rel_path = msg.get("rel_path")
+                    if isinstance(rel_path, str) and rel_path:
+                        rel_norm = rel_path.replace("\\", "/")
+                        if (rel_norm not in sess.paths) or (not self._is_allowed_path(rel_norm)):
+                            continue
+
                     await self._safe_send(sess.target_id, msg)
 
                 elif mtype == "SYNC_DONE":
