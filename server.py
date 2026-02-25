@@ -1,4 +1,3 @@
-# server.py
 import asyncio
 import json
 import struct
@@ -40,14 +39,16 @@ class ClientConn:
     reader: asyncio.StreamReader = None  # type: ignore
     writer: asyncio.StreamWriter = None  # type: ignore
 
-    # Client-local manifest summary
     manifest_hash: str = ""
     manifest_count: int = 0
     manifest_bytes: int = 0
 
-    # Client full manifest (list of {rel_path,size,sha256})
     manifest_items: Optional[List[Dict[str, Any]]] = None
     manifest_items_at: float = 0.0
+
+    manifest_request_inflight: bool = False
+    manifest_last_request_at: float = 0.0
+    manifest_refresh_pending: bool = False
 
 
 @dataclass
@@ -55,22 +56,12 @@ class SyncSession:
     sync_id: str
     source_id: str
     target_id: str
-    paths: List[str]  # paths requested from source to target
+    paths: List[str]
     union_hash: str
     created_at: float = field(default_factory=time.time)
 
 
 class SyncServer:
-    """
-    UNION MERGE SERVER:
-
-    - Collect full manifests from all clients
-    - Compute global union manifest (with conflict renaming)
-    - For each client, compute missing items vs union
-    - Schedule sync sessions SOURCE -> TARGET for missing files
-      (multi-source; each session only contains files a given source has)
-    """
-
     def __init__(self, host: str = "0.0.0.0", port: int = 9239):
         self.host = host
         self.port = port
@@ -80,15 +71,70 @@ class SyncServer:
 
         self._lock = asyncio.Lock()
 
-        # Scheduling knobs
-        self.MAX_FILES_PER_SESSION = 50           # keep sessions reasonably small
-        self.MANIFEST_STALE_SECONDS = 15.0        # if manifest older than this, ask refresh
-        self.SCHEDULER_TICK_SECONDS = 1.0         # periodic scheduler
-        self.CONFLICT_SUFFIX = "__CONFLICT__"     # conflict marker
+        self.MAX_FILES_PER_SESSION = 50
+        self.MANIFEST_STALE_SECONDS = 15.0
+        self.SCHEDULER_TICK_SECONDS = 1.0
+        self.CONFLICT_SUFFIX = "__CONFLICT__"
+        self.MANIFEST_REQUEST_MIN_INTERVAL = 3.0
 
-        # Validation knobs
-        self.ALLOWED_EXTS: Set[str] = {".png", ".jpg", ".dds", ".json"}
+        # ONLY allow these:
+        self.ALLOWED_EXTS: Set[str] = {".png", ".dds", ".json"}
         self._sha256_re = re.compile(r"^[0-9a-fA-F]{64}$")
+
+        # Whitelist (root/whitelist.txt)
+        self.WHITELIST_FILE = os.path.join(os.getcwd(), "whitelist.txt")
+        self.whitelist_names: Set[str] = set()
+        self._whitelist_mtime: float = 0.0
+        self._load_whitelist(force=True)
+
+    # -----------------------------
+    # Whitelist
+    # -----------------------------
+    def _load_whitelist(self, force: bool = False) -> None:
+        try:
+            if not os.path.isfile(self.WHITELIST_FILE):
+                if force:
+                    self.whitelist_names = set()
+                    self._whitelist_mtime = 0.0
+                return
+
+            st = os.stat(self.WHITELIST_FILE)
+            mtime = float(st.st_mtime)
+            if (not force) and (mtime == self._whitelist_mtime):
+                return
+
+            names: Set[str] = set()
+            with open(self.WHITELIST_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    s = s.replace("\\", "/").strip().strip("/")
+                    if s:
+                        names.add(s)
+
+            self.whitelist_names = names
+            self._whitelist_mtime = mtime
+
+            if names:
+                print(f"[WHITELIST] Loaded {len(names)} names from whitelist.txt")
+            else:
+                print("[WHITELIST] whitelist.txt present but empty -> allowing ALL liveries")
+        except Exception as e:
+            print(f"[WHITELIST] Failed to load whitelist.txt ({e}) -> allowing ALL liveries")
+            self.whitelist_names = set()
+            self._whitelist_mtime = 0.0
+
+    def _is_whitelisted_path(self, rel_path: str) -> bool:
+        if not self.whitelist_names:
+            return True
+        if not isinstance(rel_path, str) or not rel_path:
+            return False
+        rp = rel_path.replace("\\", "/").lstrip("/")
+        first = rp.split("/", 1)[0].strip()
+        if not first:
+            return False
+        return first in self.whitelist_names
 
     # -----------------------------
     # Validation helpers
@@ -96,15 +142,17 @@ class SyncServer:
     def _is_allowed_path(self, rel_path: str) -> bool:
         if not isinstance(rel_path, str) or not rel_path:
             return False
-        # normalize slashes; do not allow absolute paths
         rp = rel_path.replace("\\", "/")
         if rp.startswith("/") or rp.startswith("\\"):
             return False
-        # simple traversal guard
         if ".." in rp.split("/"):
             return False
         _base, ext = os.path.splitext(rp)
-        return ext.lower() in self.ALLOWED_EXTS
+        if ext.lower() not in self.ALLOWED_EXTS:
+            return False
+        if not self._is_whitelisted_path(rp):
+            return False
+        return True
 
     def _is_valid_sha256(self, sha256: str) -> bool:
         if not isinstance(sha256, str) or not sha256:
@@ -112,12 +160,6 @@ class SyncServer:
         return bool(self._sha256_re.match(sha256))
 
     def _sanitize_manifest(self, manifest: Any) -> List[Dict[str, Any]]:
-        """
-        Keep only entries that:
-          - have rel_path with allowed extension: .png .jpg .dds .json
-          - have sha256 that looks like 64 hex chars
-          - have size as int >= 0
-        """
         if not isinstance(manifest, list):
             return []
 
@@ -134,6 +176,7 @@ class SyncServer:
             rel_norm = rel.replace("\\", "/").strip()
             sh_norm = sh.strip()
 
+            # includes extension + whitelist + traversal guards
             if not self._is_allowed_path(rel_norm):
                 continue
             if not self._is_valid_sha256(sh_norm):
@@ -148,7 +191,6 @@ class SyncServer:
 
             out.append({"rel_path": rel_norm, "sha256": sh_norm, "size": size})
 
-        # stable order (helps determinism)
         out.sort(key=lambda x: (x["rel_path"], x["sha256"], x["size"]))
         return out
 
@@ -169,7 +211,6 @@ class SyncServer:
     # -----------------------------
     @staticmethod
     def _hash_manifest_items(items: List[Dict[str, Any]]) -> str:
-        # Deterministic hash over sorted (rel_path, sha256, size)
         norm = [
             {"rel_path": str(i.get("rel_path", "")),
              "sha256": str(i.get("sha256", "")),
@@ -186,22 +227,19 @@ class SyncServer:
         base, ext = os.path.splitext(rel_path)
         return base, ext
 
-    def _add_conflict_name(self, rel_path: str, sha256: str) -> str:
+    def _conflict_name(self, rel_path: str, sha256: str, attempt: int = 0) -> str:
         base, ext = self._split_ext(rel_path)
         short = (sha256 or "")[:8] if sha256 else "unknown"
-        return f"{base}{self.CONFLICT_SUFFIX}{short}{ext}"
+        if attempt <= 0:
+            return f"{base}{self.CONFLICT_SUFFIX}{short}{ext}"
+        return f"{base}{self.CONFLICT_SUFFIX}{short}_{attempt}{ext}"
 
     def _build_union(self) -> Tuple[List[Dict[str, Any]], str, Dict[str, List[Tuple[str, Dict[str, Any]]]]]:
-        """
-        Returns:
-          union_items: list of dict {rel_path,size,sha256}
-          union_hash: sha256 over union_items
-          providers: mapping rel_path -> list of (client_id, item)
-                     (for conflict-renamed entries too)
-        """
-        # Collect all items from all clients with manifest_items
-        all_entries: List[Tuple[str, Dict[str, Any]]] = []
+        by_rel: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+
         for cid, c in self.clients.items():
+            if c.manifest_refresh_pending:
+                continue
             if not c.manifest_items:
                 continue
             for it in c.manifest_items:
@@ -218,48 +256,79 @@ class SyncServer:
                 if not self._is_valid_sha256(sh):
                     continue
 
-                size = int(it.get("size", 0))
-                all_entries.append((cid, {"rel_path": reln, "sha256": sh, "size": size}))
+                try:
+                    size = int(it.get("size", 0))
+                except Exception:
+                    continue
+                if size < 0:
+                    continue
 
-        # Union by rel_path, but keep conflicts by renaming later ones
+                by_rel.setdefault(reln, []).append((cid, {"rel_path": reln, "sha256": sh, "size": size}))
+
         union_map: Dict[str, Dict[str, Any]] = {}
         providers: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
 
-        # Stable iteration order for reproducibility
-        all_entries.sort(key=lambda x: (x[1]["rel_path"], x[1]["sha256"], x[0]))
+        for rel in sorted(by_rel.keys()):
+            entries = by_rel[rel]
 
-        for cid, it in all_entries:
-            rel = it["rel_path"]
-            sh = it["sha256"]
+            sha_groups: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+            for cid, it in entries:
+                sha_groups.setdefault(it["sha256"], []).append((cid, it))
+
+            def best_key(pair: Tuple[str, Dict[str, Any]]) -> Tuple[float, str]:
+                cid, _it = pair
+                c = self.clients.get(cid)
+                return ((c.connected_at if c else float("inf")), cid)
+
+            canonical_sha: Optional[str] = None
+            canonical_provider: Optional[Tuple[str, Dict[str, Any]]] = None
+
+            for sh, group in sha_groups.items():
+                group_best = min(group, key=best_key)
+                if canonical_provider is None:
+                    canonical_provider = group_best
+                    canonical_sha = sh
+                else:
+                    if best_key(group_best) < best_key(canonical_provider):
+                        canonical_provider = group_best
+                        canonical_sha = sh
+
+            if canonical_sha is None or canonical_provider is None:
+                continue
+
+            _canon_cid, canon_item = canonical_provider
+            canon_entry = {"rel_path": rel, "sha256": canon_item["sha256"], "size": canon_item["size"]}
 
             if rel not in union_map:
-                union_map[rel] = it
-                providers.setdefault(rel, []).append((cid, it))
-                continue
+                union_map[rel] = canon_entry
 
-            # Same rel_path exists
-            if union_map[rel]["sha256"] == sh:
-                # exact duplicate content; still record provider
-                providers.setdefault(rel, []).append((cid, it))
-                continue
+            for cid, _it in sha_groups[canonical_sha]:
+                providers.setdefault(rel, []).append((cid, canon_entry))
 
-            # Conflict: same rel_path but different content
-            conflict_rel = self._add_conflict_name(rel, sh)
-            # Ensure no collision with existing union entry names
-            while conflict_rel in union_map:
-                conflict_rel = self._add_conflict_name(conflict_rel, sh)
+            for sh, group in sorted(sha_groups.items(), key=lambda kv: kv[0]):
+                if sh == canonical_sha:
+                    continue
 
-            it2 = {"rel_path": conflict_rel, "sha256": sh, "size": it.get("size", 0)}
-            union_map[conflict_rel] = it2
-            providers.setdefault(conflict_rel, []).append((cid, it2))
+                attempt = 0
+                conflict_rel = self._conflict_name(rel, sh, attempt=attempt)
+                while conflict_rel in union_map:
+                    attempt += 1
+                    conflict_rel = self._conflict_name(rel, sh, attempt=attempt)
+
+                rep_cid, rep_it = min(group, key=best_key)
+                conflict_entry = {"rel_path": conflict_rel, "sha256": sh, "size": int(rep_it.get("size", 0))}
+                union_map[conflict_rel] = conflict_entry
+
+                for cid, _it in group:
+                    providers.setdefault(conflict_rel, []).append((cid, conflict_entry))
 
         union_items = list(union_map.values())
         union_items.sort(key=lambda x: x["rel_path"])
-        union_hash = self._hash_manifest_items(union_items)
+        union_hash = self._hash_manifest_items(union_items) if union_items else ""
         return union_items, union_hash, providers
 
     # -----------------------------
-    # Diff: what a client is missing vs union
+    # Diff
     # -----------------------------
     @staticmethod
     def _manifest_map(items: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -283,14 +352,13 @@ class SyncServer:
         return missing
 
     # -----------------------------
-    # Picking a source for a given rel_path
+    # Source selection
     # -----------------------------
     def _pick_source_for_path(self, rel_path: str, providers: Dict[str, List[Tuple[str, Dict[str, Any]]]]) -> Optional[str]:
-        # Prefer earliest connected provider that isn't currently syncing
         cand: List[ClientConn] = []
         for cid, _it in providers.get(rel_path, []):
             c = self.clients.get(cid)
-            if not c or c.syncing:
+            if not c or c.syncing or c.manifest_refresh_pending:
                 continue
             cand.append(c)
         if not cand:
@@ -299,57 +367,70 @@ class SyncServer:
         return cand[0].client_id
 
     # -----------------------------
-    # Scheduling union syncs
+    # Manifest request control
     # -----------------------------
-    async def _ensure_fresh_manifests(self) -> None:
-        """
-        Ask clients for MANIFEST_FULL if missing or stale.
-        """
+    async def _request_manifest_if_needed(self, c: ClientConn, force: bool = False) -> None:
+        if not c.writer or c.syncing:
+            return
         now = time.time()
-        for cid, c in list(self.clients.items()):
+
+        if c.manifest_request_inflight and not force:
+            return
+        if not force and (now - c.manifest_last_request_at) < self.MANIFEST_REQUEST_MIN_INTERVAL:
+            return
+
+        c.manifest_request_inflight = True
+        c.manifest_last_request_at = now
+        await self._safe_send(c.client_id, {"type": "REQUEST_MANIFEST", "sync_id": ""})
+
+    async def _ensure_fresh_manifests(self) -> None:
+        now = time.time()
+        for c in list(self.clients.values()):
             if not c.writer:
                 continue
-            need = (c.manifest_items is None) or ((now - c.manifest_items_at) > self.MANIFEST_STALE_SECONDS)
-            if need and not c.syncing:
-                await self._safe_send(cid, {"type": "REQUEST_MANIFEST", "sync_id": ""})
+            if c.syncing:
+                continue
 
+            stale = (c.manifest_items is None) or ((now - c.manifest_items_at) > self.MANIFEST_STALE_SECONDS)
+
+            if c.manifest_refresh_pending:
+                await self._request_manifest_if_needed(c, force=False)
+                continue
+
+            if stale:
+                await self._request_manifest_if_needed(c, force=False)
+
+    # -----------------------------
+    # Scheduling union syncs
+    # -----------------------------
     async def maybe_schedule_union_syncs(self) -> None:
         async with self._lock:
-            # Need manifests first
-            have_any = any(c.manifest_items for c in self.clients.values())
-            if not have_any:
+            union_items, union_hash, providers = self._build_union()
+            if not union_items:
                 return
 
-            union_items, union_hash, providers = self._build_union()
-
-            # Build missing lists for each target
             targets: List[Tuple[ClientConn, List[str]]] = []
             for c in self.clients.values():
                 if c.syncing:
                     continue
-                if not c.manifest_items:
-                    # treat as missing all
-                    missing = [u["rel_path"] for u in union_items]
-                else:
-                    missing = self._client_missing(c, union_items)
+                if c.manifest_refresh_pending:
+                    continue
+                missing = self._client_missing(c, union_items)
                 if missing:
                     targets.append((c, missing))
 
             if not targets:
                 return
 
-            # Prioritize earliest connected targets (or could do most-missing first)
-            targets.sort(key=lambda t: t[0].connected_at)
+            targets.sort(key=lambda t: (-len(t[1]), t[0].connected_at))
 
-            # Create sessions until we can't
             for target_conn, missing in targets:
-                if target_conn.syncing:
+                if target_conn.syncing or target_conn.manifest_refresh_pending:
                     continue
 
-                # Group missing by chosen source
                 per_source: Dict[str, List[str]] = {}
                 for rel in missing:
-                    # extension check before scheduling
+                    # includes ONLY {png,dds,json} + whitelist
                     if not self._is_allowed_path(rel):
                         continue
                     src = self._pick_source_for_path(rel, providers)
@@ -359,18 +440,17 @@ class SyncServer:
                         continue
                     per_source.setdefault(src, []).append(rel)
 
-                # For each source, schedule a session (limited)
-                for src_id, paths in per_source.items():
+                source_order = sorted(per_source.items(), key=lambda kv: -len(kv[1]))
+
+                for src_id, paths in source_order:
                     src_conn = self.clients.get(src_id)
-                    if not src_conn or src_conn.syncing or target_conn.syncing:
+                    if not src_conn or src_conn.syncing or src_conn.manifest_refresh_pending or target_conn.syncing:
                         continue
 
-                    # Chunk to MAX_FILES_PER_SESSION
                     chunk = paths[: self.MAX_FILES_PER_SESSION]
                     if not chunk:
                         continue
 
-                    # Lock source + target
                     src_conn.syncing = True
                     target_conn.syncing = True
 
@@ -383,8 +463,6 @@ class SyncServer:
                         union_hash=union_hash,
                     )
 
-                    # Notify both of session
-                    # (role names kept for client compatibility)
                     asyncio.create_task(self._safe_send(src_id, {
                         "type": "SYNC_OFFER",
                         "sync_id": sync_id,
@@ -402,7 +480,6 @@ class SyncServer:
                         "target_client_id": target_conn.client_id,
                     }))
 
-                    # Ask source to send these files
                     asyncio.create_task(self._safe_send(src_id, {
                         "type": "SEND_FILES",
                         "sync_id": sync_id,
@@ -413,7 +490,6 @@ class SyncServer:
                           f"TARGET={target_conn.client_name or target_conn.client_id} "
                           f"files={len(chunk)} union={union_hash}")
 
-                    # Schedule one session at a time (avoid starving others)
                     return
 
     async def _end_sync(self, sync_id: str, reason: str = "") -> None:
@@ -458,13 +534,12 @@ class SyncServer:
                     conn.client_name = str(msg.get("client_name", ""))
                     conn.manifest_hash = str(msg.get("manifest_hash", ""))
 
-                    # Tell them current union hash (if available)
                     union_items, union_hash, _providers = self._build_union()
                     current = union_hash if union_items else (conn.manifest_hash or "")
                     await send_msg(writer, {"type": "SERVER_STATE", "current_hash": current})
 
-                    # Ask for full manifest immediately (union needs it)
-                    await send_msg(writer, {"type": "REQUEST_MANIFEST", "sync_id": ""})
+                    await self._request_manifest_if_needed(conn, force=True)
+                    await self.maybe_schedule_union_syncs()
 
                 elif mtype == "MANIFEST_SUMMARY":
                     conn.manifest_hash = str(msg.get("manifest_hash", conn.manifest_hash))
@@ -473,29 +548,13 @@ class SyncServer:
 
                 elif mtype == "MANIFEST_FULL":
                     manifest = msg.get("manifest")
-
-                    # Filter manifest to only allowed extensions + valid sha256/size
                     sanitized = self._sanitize_manifest(manifest)
 
-                    # Store client's sanitized manifest
                     conn.manifest_items = sanitized
                     conn.manifest_items_at = time.time()
+                    conn.manifest_request_inflight = False
+                    conn.manifest_refresh_pending = False
 
-                    # Update summary hash if present
-                    # (client computes its own hash; we accept it)
-                    sid = str(msg.get("sync_id", ""))  # may be "" in union mode
-
-                    # If this MANIFEST_FULL belongs to a specific sync request, optionally forward to target
-                    if sid and sid in self.syncs:
-                        sess = self.syncs.get(sid)
-                        if sess and sess.source_id == client_id:
-                            await self._safe_send(sess.target_id, {
-                                "type": "MANIFEST_FULL",
-                                "sync_id": sid,
-                                "manifest": sanitized,
-                            })
-
-                    # After receiving manifest, attempt scheduling
                     await self.maybe_schedule_union_syncs()
 
                 elif mtype in ("FILE_BEGIN", "FILE_CHUNK", "FILE_END"):
@@ -503,15 +562,13 @@ class SyncServer:
                     sess = self.syncs.get(sync_id)
                     if not sess:
                         continue
-                    # Relay only from SOURCE -> TARGET
                     if client_id != sess.source_id:
                         continue
 
-                    # Extension gate:
-                    # - If message carries a rel_path (expected on FILE_BEGIN/FILE_END), drop if invalid or not in session paths.
                     rel_path = msg.get("rel_path")
                     if isinstance(rel_path, str) and rel_path:
                         rel_norm = rel_path.replace("\\", "/")
+                        # ignore anything not in allowed set (.png/.dds/.json) or not whitelisted
                         if (rel_norm not in sess.paths) or (not self._is_allowed_path(rel_norm)):
                             continue
 
@@ -524,15 +581,15 @@ class SyncServer:
                     sess = self.syncs.get(sync_id)
                     if not sess:
                         continue
-
-                    # Only target can finish session
                     if sess.target_id != client_id:
                         continue
 
-                    # Update target summary hash; full manifest will be refreshed shortly
                     conn.manifest_hash = new_hash
 
-                    # Ack source
+                    conn.manifest_refresh_pending = True
+                    conn.manifest_request_inflight = False
+                    conn.manifest_items_at = 0.0
+
                     await self._safe_send(sess.source_id, {
                         "type": "SYNC_DONE_ACK",
                         "sync_id": sync_id,
@@ -540,11 +597,7 @@ class SyncServer:
                     })
 
                     await self._end_sync(sync_id, reason="completed")
-
-                    # Ask target for fresh manifest so union stays accurate
-                    await self._safe_send(client_id, {"type": "REQUEST_MANIFEST", "sync_id": ""})
-
-                    # Try schedule more
+                    await self._request_manifest_if_needed(conn, force=True)
                     await self.maybe_schedule_union_syncs()
 
                 elif mtype == "ERROR":
@@ -563,13 +616,16 @@ class SyncServer:
         except Exception as e:
             print(f"[EXCEPTION] client {client_id}: {e}")
         finally:
-            # Cleanup
+            sync_ids_to_end: List[str] = []
+
             async with self._lock:
-                # end any sync involving this client
                 for sid, sess in list(self.syncs.items()):
                     if sess.source_id == client_id or sess.target_id == client_id:
-                        await self._end_sync(sid, reason="peer disconnected")
+                        sync_ids_to_end.append(sid)
                 self.clients.pop(client_id, None)
+
+            for sid in sync_ids_to_end:
+                await self._end_sync(sid, reason="peer disconnected")
 
             try:
                 writer.close()
@@ -578,13 +634,12 @@ class SyncServer:
                 pass
 
             print(f"[DISCONNECT] {client_id}")
-
-            # Attempt scheduling after disconnect
             await self.maybe_schedule_union_syncs()
 
     async def _scheduler_loop(self) -> None:
         while True:
             try:
+                self._load_whitelist(force=False)
                 await self._ensure_fresh_manifests()
                 await self.maybe_schedule_union_syncs()
             except Exception:
@@ -596,7 +651,6 @@ class SyncServer:
         addr = ", ".join(str(s.getsockname()) for s in server.sockets or [])
         print(f"[START] Listening on {addr}")
 
-        # Start background scheduler loop
         asyncio.create_task(self._scheduler_loop())
 
         async with server:
