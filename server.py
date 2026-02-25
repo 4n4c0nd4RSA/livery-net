@@ -1,3 +1,4 @@
+# server.py
 import asyncio
 import json
 import struct
@@ -160,6 +161,13 @@ class SyncServer:
         return bool(self._sha256_re.match(sha256))
 
     def _sanitize_manifest(self, manifest: Any) -> List[Dict[str, Any]]:
+        """
+        Accepts items with:
+          - rel_path (str)
+          - sha256 (str)
+          - size (int)
+          - mtime (float|int)  <-- UNIX seconds (last modified)
+        """
         if not isinstance(manifest, list):
             return []
 
@@ -176,7 +184,6 @@ class SyncServer:
             rel_norm = rel.replace("\\", "/").strip()
             sh_norm = sh.strip()
 
-            # includes extension + whitelist + traversal guards
             if not self._is_allowed_path(rel_norm):
                 continue
             if not self._is_valid_sha256(sh_norm):
@@ -189,9 +196,17 @@ class SyncServer:
             if size < 0:
                 continue
 
-            out.append({"rel_path": rel_norm, "sha256": sh_norm, "size": size})
+            mtime_val = it.get("mtime", 0)
+            try:
+                mtime_f = float(mtime_val)
+            except Exception:
+                mtime_f = 0.0
+            if mtime_f < 0:
+                mtime_f = 0.0
 
-        out.sort(key=lambda x: (x["rel_path"], x["sha256"], x["size"]))
+            out.append({"rel_path": rel_norm, "sha256": sh_norm, "size": size, "mtime": mtime_f})
+
+        out.sort(key=lambda x: (x["rel_path"], x["sha256"], x["size"], x.get("mtime", 0.0)))
         return out
 
     # -----------------------------
@@ -211,10 +226,13 @@ class SyncServer:
     # -----------------------------
     @staticmethod
     def _hash_manifest_items(items: List[Dict[str, Any]]) -> str:
+        # Union hash should be based on content identity, not mtime.
         norm = [
-            {"rel_path": str(i.get("rel_path", "")),
-             "sha256": str(i.get("sha256", "")),
-             "size": int(i.get("size", 0))}
+            {
+                "rel_path": str(i.get("rel_path", "")),
+                "sha256": str(i.get("sha256", "")),
+                "size": int(i.get("size", 0)),
+            }
             for i in items
             if i.get("rel_path") and i.get("sha256")
         ]
@@ -235,6 +253,13 @@ class SyncServer:
         return f"{base}{self.CONFLICT_SUFFIX}{short}_{attempt}{ext}"
 
     def _build_union(self) -> Tuple[List[Dict[str, Any]], str, Dict[str, List[Tuple[str, Dict[str, Any]]]]]:
+        """
+        CONFLICT RULE:
+          - For same rel_path with different sha256:
+              pick canonical sha by newest mtime (max mtime)
+              if tie: fall back to earliest connected_at
+          - Non-canonical hashes get stored as __CONFLICT__ files.
+        """
         by_rel: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
 
         for cid, c in self.clients.items():
@@ -263,7 +288,16 @@ class SyncServer:
                 if size < 0:
                     continue
 
-                by_rel.setdefault(reln, []).append((cid, {"rel_path": reln, "sha256": sh, "size": size}))
+                try:
+                    mtime_f = float(it.get("mtime", 0.0))
+                except Exception:
+                    mtime_f = 0.0
+                if mtime_f < 0:
+                    mtime_f = 0.0
+
+                by_rel.setdefault(reln, []).append(
+                    (cid, {"rel_path": reln, "sha256": sh, "size": size, "mtime": mtime_f})
+                )
 
         union_map: Dict[str, Dict[str, Any]] = {}
         providers: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
@@ -275,29 +309,38 @@ class SyncServer:
             for cid, it in entries:
                 sha_groups.setdefault(it["sha256"], []).append((cid, it))
 
-            def best_key(pair: Tuple[str, Dict[str, Any]]) -> Tuple[float, str]:
+            def connected_key(pair: Tuple[str, Dict[str, Any]]) -> Tuple[float, str]:
                 cid, _it = pair
                 c = self.clients.get(cid)
                 return ((c.connected_at if c else float("inf")), cid)
 
-            canonical_sha: Optional[str] = None
-            canonical_provider: Optional[Tuple[str, Dict[str, Any]]] = None
-
+            sha_fresh: List[Tuple[str, float, Tuple[str, Dict[str, Any]]]] = []
             for sh, group in sha_groups.items():
-                group_best = min(group, key=best_key)
-                if canonical_provider is None:
-                    canonical_provider = group_best
-                    canonical_sha = sh
-                else:
-                    if best_key(group_best) < best_key(canonical_provider):
-                        canonical_provider = group_best
-                        canonical_sha = sh
+                group_mtime = 0.0
+                for _cid, it in group:
+                    try:
+                        mt = float(it.get("mtime", 0.0))
+                    except Exception:
+                        mt = 0.0
+                    if mt > group_mtime:
+                        group_mtime = mt
 
-            if canonical_sha is None or canonical_provider is None:
+                rep = min(group, key=connected_key)
+                sha_fresh.append((sh, group_mtime, rep))
+
+            if not sha_fresh:
                 continue
 
+            sha_fresh.sort(key=lambda x: (-x[1], connected_key(x[2])))
+            canonical_sha, _canonical_mtime, canonical_provider = sha_fresh[0]
+
             _canon_cid, canon_item = canonical_provider
-            canon_entry = {"rel_path": rel, "sha256": canon_item["sha256"], "size": canon_item["size"]}
+            canon_entry = {
+                "rel_path": rel,
+                "sha256": canon_item["sha256"],
+                "size": int(canon_item["size"]),
+                "mtime": float(canon_item.get("mtime", 0.0)),
+            }
 
             if rel not in union_map:
                 union_map[rel] = canon_entry
@@ -315,8 +358,13 @@ class SyncServer:
                     attempt += 1
                     conflict_rel = self._conflict_name(rel, sh, attempt=attempt)
 
-                rep_cid, rep_it = min(group, key=best_key)
-                conflict_entry = {"rel_path": conflict_rel, "sha256": sh, "size": int(rep_it.get("size", 0))}
+                rep_cid, rep_it = min(group, key=connected_key)
+                conflict_entry = {
+                    "rel_path": conflict_rel,
+                    "sha256": sh,
+                    "size": int(rep_it.get("size", 0)),
+                    "mtime": float(rep_it.get("mtime", 0.0) or 0.0),
+                }
                 union_map[conflict_rel] = conflict_entry
 
                 for cid, _it in group:
@@ -332,11 +380,7 @@ class SyncServer:
     # -----------------------------
     @staticmethod
     def _manifest_map(items: List[Dict[str, Any]]) -> Dict[str, str]:
-        return {
-            str(i.get("rel_path")): str(i.get("sha256"))
-            for i in items
-            if i.get("rel_path") and i.get("sha256")
-        }
+        return {str(i.get("rel_path")): str(i.get("sha256")) for i in items if i.get("rel_path") and i.get("sha256")}
 
     def _client_missing(self, client: ClientConn, union_items: List[Dict[str, Any]]) -> List[str]:
         if not client.manifest_items:
@@ -354,7 +398,9 @@ class SyncServer:
     # -----------------------------
     # Source selection
     # -----------------------------
-    def _pick_source_for_path(self, rel_path: str, providers: Dict[str, List[Tuple[str, Dict[str, Any]]]]) -> Optional[str]:
+    def _pick_source_for_path(
+        self, rel_path: str, providers: Dict[str, List[Tuple[str, Dict[str, Any]]]]
+    ) -> Optional[str]:
         cand: List[ClientConn] = []
         for cid, _it in providers.get(rel_path, []):
             c = self.clients.get(cid)
@@ -430,7 +476,6 @@ class SyncServer:
 
                 per_source: Dict[str, List[str]] = {}
                 for rel in missing:
-                    # includes ONLY {png,dds,json} + whitelist
                     if not self._is_allowed_path(rel):
                         continue
                     src = self._pick_source_for_path(rel, providers)
@@ -568,7 +613,6 @@ class SyncServer:
                     rel_path = msg.get("rel_path")
                     if isinstance(rel_path, str) and rel_path:
                         rel_norm = rel_path.replace("\\", "/")
-                        # ignore anything not in allowed set (.png/.dds/.json) or not whitelisted
                         if (rel_norm not in sess.paths) or (not self._is_allowed_path(rel_norm)):
                             continue
 
@@ -660,7 +704,7 @@ class SyncServer:
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="ACC Liveries Sync Server (UNION MERGE)")
+    ap = argparse.ArgumentParser(description="ACC Liveries Sync Server (UNION MERGE, MTIME-WINS)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=9239)
     args = ap.parse_args()
