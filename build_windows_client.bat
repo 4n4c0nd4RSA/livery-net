@@ -1,0 +1,1 @@
+python -m PyInstaller --onefile --name acc_sync_client client.py

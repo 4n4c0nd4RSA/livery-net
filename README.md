@@ -43,7 +43,7 @@ After an initial convergence pass, every connected client ends up with the **uni
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+
 - No third-party dependencies — only standard library modules (`asyncio`, `hashlib`, `struct`, `json`, `base64`, `shutil`, `uuid`, etc.)
 - **Server**: any OS (Linux recommended for headless hosting)
 - **Client**: Windows (Steam ID detection is Windows-specific; the rest is cross-platform)
