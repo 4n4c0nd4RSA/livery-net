@@ -72,10 +72,9 @@ class SyncServer:
 
         self._lock = asyncio.Lock()
 
-        self.MAX_FILES_PER_SESSION = 50
+        self.MAX_FILES_PER_SESSION = 500
         self.MANIFEST_STALE_SECONDS = 15.0
         self.SCHEDULER_TICK_SECONDS = 1.0
-        self.CONFLICT_SUFFIX = "__CONFLICT__"
         self.MANIFEST_REQUEST_MIN_INTERVAL = 3.0
 
         # ONLY allow these:
@@ -147,6 +146,10 @@ class SyncServer:
         if rp.startswith("/") or rp.startswith("\\"):
             return False
         if ".." in rp.split("/"):
+            return False
+        if "__CONFLICT__" in rp:
+            return False
+        if "Copy." in rp:
             return False
         _base, ext = os.path.splitext(rp)
         if ext.lower() not in self.ALLOWED_EXTS:
@@ -228,11 +231,7 @@ class SyncServer:
     def _hash_manifest_items(items: List[Dict[str, Any]]) -> str:
         # Union hash should be based on content identity, not mtime.
         norm = [
-            {
-                "rel_path": str(i.get("rel_path", "")),
-                "sha256": str(i.get("sha256", "")),
-                "size": int(i.get("size", 0)),
-            }
+            {"rel_path": str(i.get("rel_path", "")), "sha256": str(i.get("sha256", "")), "size": int(i.get("size", 0))}
             for i in items
             if i.get("rel_path") and i.get("sha256")
         ]
@@ -240,25 +239,13 @@ class SyncServer:
         blob = json.dumps(norm, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         return hashlib.sha256(blob).hexdigest()
 
-    @staticmethod
-    def _split_ext(rel_path: str) -> Tuple[str, str]:
-        base, ext = os.path.splitext(rel_path)
-        return base, ext
-
-    def _conflict_name(self, rel_path: str, sha256: str, attempt: int = 0) -> str:
-        base, ext = self._split_ext(rel_path)
-        short = (sha256 or "")[:8] if sha256 else "unknown"
-        if attempt <= 0:
-            return f"{base}{self.CONFLICT_SUFFIX}{short}{ext}"
-        return f"{base}{self.CONFLICT_SUFFIX}{short}_{attempt}{ext}"
-
     def _build_union(self) -> Tuple[List[Dict[str, Any]], str, Dict[str, List[Tuple[str, Dict[str, Any]]]]]:
         """
-        CONFLICT RULE:
-          - For same rel_path with different sha256:
-              pick canonical sha by newest mtime (max mtime)
-              if tie: fall back to earliest connected_at
-          - Non-canonical hashes get stored as __CONFLICT__ files.
+        IMPORTANT:
+        - The server union must ONLY include real client paths.
+        - Pick ONE canonical item per rel_path:
+            newest mtime wins; tie -> earliest connected_at wins.
+        providers[rel_path] tracks which clients can source the canonical file.
         """
         by_rel: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
 
@@ -295,80 +282,39 @@ class SyncServer:
                 if mtime_f < 0:
                     mtime_f = 0.0
 
-                by_rel.setdefault(reln, []).append(
-                    (cid, {"rel_path": reln, "sha256": sh, "size": size, "mtime": mtime_f})
-                )
+                by_rel.setdefault(reln, []).append((cid, {"rel_path": reln, "sha256": sh, "size": size, "mtime": mtime_f}))
 
         union_map: Dict[str, Dict[str, Any]] = {}
         providers: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
 
+        def connected_at(cid: str) -> float:
+            c = self.clients.get(cid)
+            return c.connected_at if c else float("inf")
+
         for rel in sorted(by_rel.keys()):
             entries = by_rel[rel]
 
-            sha_groups: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
-            for cid, it in entries:
-                sha_groups.setdefault(it["sha256"], []).append((cid, it))
+            # pick canonical by (mtime desc, connected_at asc)
+            def canon_key(pair: Tuple[str, Dict[str, Any]]) -> Tuple[float, float]:
+                cid, it = pair
+                mt = float(it.get("mtime", 0.0) or 0.0)
+                return (-mt, connected_at(cid))
 
-            def connected_key(pair: Tuple[str, Dict[str, Any]]) -> Tuple[float, str]:
-                cid, _it = pair
-                c = self.clients.get(cid)
-                return ((c.connected_at if c else float("inf")), cid)
+            canon_cid, canon_it = min(entries, key=canon_key)
 
-            sha_fresh: List[Tuple[str, float, Tuple[str, Dict[str, Any]]]] = []
-            for sh, group in sha_groups.items():
-                group_mtime = 0.0
-                for _cid, it in group:
-                    try:
-                        mt = float(it.get("mtime", 0.0))
-                    except Exception:
-                        mt = 0.0
-                    if mt > group_mtime:
-                        group_mtime = mt
-
-                rep = min(group, key=connected_key)
-                sha_fresh.append((sh, group_mtime, rep))
-
-            if not sha_fresh:
-                continue
-
-            sha_fresh.sort(key=lambda x: (-x[1], connected_key(x[2])))
-            canonical_sha, _canonical_mtime, canonical_provider = sha_fresh[0]
-
-            _canon_cid, canon_item = canonical_provider
             canon_entry = {
                 "rel_path": rel,
-                "sha256": canon_item["sha256"],
-                "size": int(canon_item["size"]),
-                "mtime": float(canon_item.get("mtime", 0.0)),
+                "sha256": str(canon_it["sha256"]),
+                "size": int(canon_it["size"]),
+                "mtime": float(canon_it.get("mtime", 0.0) or 0.0),
             }
+            union_map[rel] = canon_entry
 
-            if rel not in union_map:
-                union_map[rel] = canon_entry
-
-            for cid, _it in sha_groups[canonical_sha]:
-                providers.setdefault(rel, []).append((cid, canon_entry))
-
-            for sh, group in sorted(sha_groups.items(), key=lambda kv: kv[0]):
-                if sh == canonical_sha:
-                    continue
-
-                attempt = 0
-                conflict_rel = self._conflict_name(rel, sh, attempt=attempt)
-                while conflict_rel in union_map:
-                    attempt += 1
-                    conflict_rel = self._conflict_name(rel, sh, attempt=attempt)
-
-                rep_cid, rep_it = min(group, key=connected_key)
-                conflict_entry = {
-                    "rel_path": conflict_rel,
-                    "sha256": sh,
-                    "size": int(rep_it.get("size", 0)),
-                    "mtime": float(rep_it.get("mtime", 0.0) or 0.0),
-                }
-                union_map[conflict_rel] = conflict_entry
-
-                for cid, _it in group:
-                    providers.setdefault(conflict_rel, []).append((cid, conflict_entry))
+            # providers are clients that have the canonical sha for this rel
+            canon_sha = canon_entry["sha256"]
+            for cid, it in entries:
+                if str(it.get("sha256", "")) == canon_sha:
+                    providers.setdefault(rel, []).append((cid, canon_entry))
 
         union_items = list(union_map.values())
         union_items.sort(key=lambda x: x["rel_path"])
@@ -460,6 +406,8 @@ class SyncServer:
                 if c.syncing:
                     continue
                 if c.manifest_refresh_pending:
+                    continue
+                if not c.manifest_items:
                     continue
                 missing = self._client_missing(c, union_items)
                 if missing:
@@ -558,6 +506,10 @@ class SyncServer:
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         client_id = str(uuid.uuid4())[:8]
         conn = ClientConn(client_id=client_id, reader=reader, writer=writer)
+        conn.manifest_refresh_pending = True
+        conn.manifest_items = None
+        conn.manifest_items_at = 0.0
+        conn.manifest_request_inflight = False
 
         async with self._lock:
             self.clients[client_id] = conn
