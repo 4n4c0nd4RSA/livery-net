@@ -19,14 +19,6 @@ DEFAULT_SERVER_PORT = 9239
 
 STEAM_LOGINUSERS = r"C:\Program Files (x86)\Steam\config\loginusers.vdf"
 
-LIVERIES_ROOT = os.path.join(
-    os.path.expanduser("~"),
-    "Documents",
-    "Assetto Corsa Competizione",
-    "Customs",
-    "Liveries",
-)
-
 CHUNK_SIZE = 256 * 1024  # 256KB
 ALLOWED_EXTS = {".png", ".dds", ".json"}
 
@@ -36,6 +28,32 @@ CONFLICT_SUFFIX = "__CONFLICT__"
 # (Small tolerance helps avoid 1-second resolution quirks / copy2 behavior.)
 MTIME_TOLERANCE_SECONDS = 1.0
 
+def find_liveries_root() -> str:
+    """
+    Attempts to find the ACC Liveries folder in standard Documents or OneDrive.
+    """
+    # 1. Standard Documents path
+    standard_docs = os.path.join(os.path.expanduser("~"), "Documents")
+    
+    # 2. Check OneDrive environment variables (common on Windows)
+    # OneDrive (Personal) or OneDriveConsumer
+    onedrive_path = os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer")
+    
+    candidates = [standard_docs]
+    if onedrive_path:
+        candidates.insert(0, os.path.join(onedrive_path, "Documents"))
+
+    sub_path = os.path.join("Assetto Corsa Competizione", "Customs", "Liveries")
+
+    for base in candidates:
+        full_path = os.path.join(base, sub_path)
+        if os.path.isdir(full_path):
+            return full_path
+
+    # Fallback to standard if none exist yet
+    return os.path.join(standard_docs, sub_path)
+
+LIVERIES_ROOT = find_liveries_root()
 
 # -----------------------------
 # Framing (len-prefixed JSON)
@@ -301,7 +319,7 @@ class SyncClient:
                         "file_count": len(self.manifest),
                         "total_bytes": sum(int(x["size"]) for x in self.manifest),
                     })
-                    print("[MANIFEST] Sent MANIFEST_FULL + SUMMARY")
+                    # print("[MANIFEST] Sent MANIFEST_FULL + SUMMARY")
 
                 elif mtype == "SEND_FILES":
                     sync_id = str(msg.get("sync_id", ""))
