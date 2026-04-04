@@ -1,4 +1,3 @@
-# client.py
 import asyncio
 import base64
 import hashlib
@@ -14,6 +13,7 @@ from typing import Dict, Any, List, Optional, Tuple
 # -----------------------------
 # Config
 # -----------------------------
+VERSION = "1.0.4"
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 9239
 
@@ -32,13 +32,12 @@ def find_liveries_root() -> str:
     """
     Attempts to find the ACC Liveries folder in standard Documents or OneDrive.
     """
-    # 1. Standard Documents path
     standard_docs = os.path.join(os.path.expanduser("~"), "Documents")
     
     # 2. Check OneDrive environment variables (common on Windows)
     # OneDrive (Personal) or OneDriveConsumer
     onedrive_path = os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer")
-    
+
     candidates = [standard_docs]
     if onedrive_path:
         candidates.insert(0, os.path.join(onedrive_path, "Documents"))
@@ -94,9 +93,77 @@ def canonical_relpath(root: str, full_path: str) -> str:
     return rel.replace("\\", "/")
 
 
+def _normalize_rel(rel: str) -> str:
+    return rel.replace("\\", "/").strip()
+
+
 def _is_allowed_rel(rel: str) -> bool:
-    _b, ext = os.path.splitext(rel.replace("\\", "/"))
+    """
+    Strict validation for any relative path received from the network or built locally.
+
+    Rules:
+    - must be a non-empty string
+    - must not be absolute
+    - must not contain parent traversal segments
+    - must not contain Windows drive prefixes
+    - must not contain NUL bytes
+    - must not contain conflict-tagged names
+    - extension must be in ALLOWED_EXTS
+    """
+    if not isinstance(rel, str):
+        return False
+
+    rp = _normalize_rel(rel)
+    if not rp:
+        return False
+
+    if "\x00" in rp:
+        return False
+
+    if rp.startswith("/") or rp.startswith("\\"):
+        return False
+
+    drive, _ = os.path.splitdrive(rp)
+    if drive:
+        return False
+
+    parts = [p for p in rp.split("/") if p not in ("", ".")]
+    if not parts:
+        return False
+
+    if ".." in parts:
+        return False
+
+    if "__CONFLICT__" in rp:
+        return False
+
+    if "Copy." in rp:
+        return False
+
+    _b, ext = os.path.splitext(rp)
     return ext.lower() in ALLOWED_EXTS
+
+
+def _safe_join_under_root(root: str, rel: str) -> str:
+    """
+    Join rel under root and verify the result remains inside root.
+    Raises ValueError if unsafe.
+    """
+    if not _is_allowed_rel(rel):
+        raise ValueError(f"Unsafe relative path: {rel!r}")
+
+    root_abs = os.path.abspath(root)
+    joined = os.path.abspath(os.path.join(root_abs, _normalize_rel(rel).replace("/", os.sep)))
+
+    try:
+        common = os.path.commonpath([root_abs, joined])
+    except ValueError:
+        raise ValueError(f"Unsafe path outside root: {rel!r}")
+
+    if common != root_abs:
+        raise ValueError(f"Unsafe path outside root: {rel!r}")
+
+    return joined
 
 
 def _conflict_path_for(final_path: str, incoming_sha256: str) -> str:
@@ -294,6 +361,24 @@ class SyncClient:
             self._sync_done_task.cancel()
         self._sync_done_task = asyncio.create_task(self._debounced_sync_done(sync_id))
 
+    def _reset_rx_state(self) -> None:
+        self._rx_tmp_path = None
+        self._rx_sha256 = None
+        self._rx_rel = None
+        self._rx_mtime = None
+        self._rx_sync_id = None
+
+    async def _report_error(self, sync_id: str, message: str) -> None:
+        print(f"[ERROR] {message}")
+        try:
+            await send_msg(self.writer, {
+                "type": "ERROR",
+                "sync_id": sync_id,
+                "message": message,
+            })
+        except Exception:
+            pass
+
     async def run(self) -> None:
         try:
             while True:
@@ -319,7 +404,6 @@ class SyncClient:
                         "file_count": len(self.manifest),
                         "total_bytes": sum(int(x["size"]) for x in self.manifest),
                     })
-                    # print("[MANIFEST] Sent MANIFEST_FULL + SUMMARY")
 
                 elif mtype == "SEND_FILES":
                     sync_id = str(msg.get("sync_id", ""))
@@ -335,11 +419,17 @@ class SyncClient:
                     for rel in paths:
                         if not isinstance(rel, str):
                             continue
-                        rel_norm = rel.replace("\\", "/")
+                        rel_norm = _normalize_rel(rel)
                         if not _is_allowed_rel(rel_norm):
+                            print(f"[WARN] Refusing to send unsafe path from server request: {rel!r}")
                             continue
 
-                        full = os.path.join(LIVERIES_ROOT, rel_norm.replace("/", os.sep))
+                        try:
+                            full = _safe_join_under_root(LIVERIES_ROOT, rel_norm)
+                        except ValueError:
+                            print(f"[WARN] Refusing to send path outside root: {rel!r}")
+                            continue
+
                         if not os.path.isfile(full):
                             continue
 
@@ -388,11 +478,15 @@ class SyncClient:
                     mt = msg.get("mtime", 0)
 
                     if not _is_allowed_rel(rel):
-                        self._rx_rel = None
-                        self._rx_sha256 = None
-                        self._rx_mtime = None
-                        self._rx_tmp_path = None
-                        self._rx_sync_id = None
+                        await self._report_error(sync_id, f"Rejected unsafe rel_path in FILE_BEGIN: {rel!r}")
+                        self._reset_rx_state()
+                        continue
+
+                    try:
+                        final_path = _safe_join_under_root(LIVERIES_ROOT, rel)
+                    except ValueError as e:
+                        await self._report_error(sync_id, f"Rejected path outside root in FILE_BEGIN: {e}")
+                        self._reset_rx_state()
                         continue
 
                     self._rx_rel = rel
@@ -408,17 +502,33 @@ class SyncClient:
                     tmp_name = f"rx_{int(time.time()*1000)}_{os.path.basename(rel).replace('/', '_')}.tmp"
                     self._rx_tmp_path = os.path.join(tmp_dir, tmp_name)
 
+                    ensure_dir(os.path.dirname(final_path))
+
                     with open(self._rx_tmp_path, "wb") as _:
                         pass
 
                 elif mtype == "FILE_CHUNK":
                     rel = str(msg.get("rel_path", ""))
+                    sync_id = str(msg.get("sync_id", ""))
+
+                    if not _is_allowed_rel(rel):
+                        await self._report_error(sync_id, f"Rejected unsafe rel_path in FILE_CHUNK: {rel!r}")
+                        continue
+
                     if not self._rx_tmp_path or rel != self._rx_rel:
                         continue
+
                     data_b64 = msg.get("data_b64", "")
                     if not isinstance(data_b64, str):
+                        await self._report_error(sync_id, f"Rejected invalid chunk payload for {rel}")
                         continue
-                    chunk = base64.b64decode(data_b64.encode("ascii"))
+
+                    try:
+                        chunk = base64.b64decode(data_b64.encode("ascii"), validate=True)
+                    except Exception:
+                        await self._report_error(sync_id, f"Rejected invalid base64 chunk for {rel}")
+                        continue
+
                     with open(self._rx_tmp_path, "ab") as f:
                         f.write(chunk)
 
@@ -426,48 +536,48 @@ class SyncClient:
                     sync_id = str(msg.get("sync_id", ""))
                     rel = str(msg.get("rel_path", ""))
 
+                    if not _is_allowed_rel(rel):
+                        await self._report_error(sync_id, f"Rejected unsafe rel_path in FILE_END: {rel!r}")
+                        continue
+
                     if not self._rx_tmp_path or rel != self._rx_rel:
                         continue
 
-                    # Verify hash
+                    try:
+                        final_path = _safe_join_under_root(LIVERIES_ROOT, rel)
+                    except ValueError as e:
+                        await self._report_error(sync_id, f"Rejected path outside root in FILE_END: {e}")
+                        try:
+                            os.remove(self._rx_tmp_path)
+                        except Exception:
+                            pass
+                        self._reset_rx_state()
+                        continue
+
                     try:
                         got = sha256_file(self._rx_tmp_path)
                     except Exception:
                         got = ""
 
                     if self._rx_sha256 and got.lower() != self._rx_sha256.lower():
-                        await send_msg(self.writer, {
-                            "type": "ERROR",
-                            "sync_id": sync_id,
-                            "message": f"Hash mismatch for {rel} expected={self._rx_sha256} got={got}",
-                        })
+                        await self._report_error(
+                            sync_id,
+                            f"Hash mismatch for {rel} expected={self._rx_sha256} got={got}",
+                        )
                         try:
                             os.remove(self._rx_tmp_path)
                         except Exception:
                             pass
-                        self._rx_tmp_path = None
-                        self._rx_rel = None
-                        self._rx_sha256 = None
-                        self._rx_mtime = None
-                        self._rx_sync_id = None
+                        self._reset_rx_state()
                         continue
-
-                    final_path = os.path.join(LIVERIES_ROOT, rel.replace("/", os.sep))
-                    ensure_dir(os.path.dirname(final_path))
 
                     incoming_mtime = float(self._rx_mtime or 0.0)
                     local_exists = os.path.isfile(final_path)
                     local_mtime = safe_get_mtime(final_path) if local_exists else 0.0
 
-                    # -----------------------------
-                    # CRITICAL FIX:
-                    # Only replace if incoming is newer.
-                    # If local is newer, keep local canonical and store incoming as conflict.
-                    # -----------------------------
                     if local_exists and (local_mtime > incoming_mtime + MTIME_TOLERANCE_SECONDS):
-                        # Local is newer -> keep it, store incoming as conflict
                         conflict_path = _conflict_path_for(final_path, got)
-                        backup_existing(conflict_path, LIVERIES_ROOT)  # optional safety
+                        backup_existing(conflict_path, LIVERIES_ROOT)
                         os.replace(self._rx_tmp_path, conflict_path)
                         safe_set_mtime(conflict_path, incoming_mtime)
 
@@ -477,7 +587,6 @@ class SyncClient:
                             f"saved incoming as {os.path.relpath(conflict_path, LIVERIES_ROOT)}"
                         )
                     else:
-                        # Incoming is newer or local missing -> overwrite canonical
                         if local_exists:
                             backup_existing(final_path, LIVERIES_ROOT)
                         os.replace(self._rx_tmp_path, final_path)
@@ -487,13 +596,7 @@ class SyncClient:
                             f"(incoming={incoming_mtime:.3f} >= local={local_mtime:.3f})"
                         )
 
-                    # reset rx state
-                    self._rx_tmp_path = None
-                    self._rx_rel = None
-                    self._rx_sha256 = None
-                    self._rx_mtime = None
-                    self._rx_sync_id = None
-
+                    self._reset_rx_state()
                     self._schedule_sync_done(sync_id)
 
                 elif mtype == "SYNC_DONE_ACK":
@@ -545,7 +648,7 @@ if __name__ == "__main__":
     import argparse
     import socket
 
-    ap = argparse.ArgumentParser(description="ACC Liveries Sync Client (MTIME NEWEST-WINS ON DISK)")
+    ap = argparse.ArgumentParser(description=f"ACC Liveries Sync Client v{VERSION} (SAFER PATH VALIDATION)")
     ap.add_argument("--host", default=DEFAULT_SERVER_HOST)
     ap.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT)
     ap.add_argument("--name", default=socket.gethostname())
