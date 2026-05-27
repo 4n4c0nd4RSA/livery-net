@@ -1,4 +1,4 @@
-# ACC Livery-Net
+# Assetto Corsa Competizione - Livery-Net
 
 A high-performance peer-assisted livery synchronization system for
 Assetto Corsa Competizione (ACC) that keeps custom liveries synchronized across multiple clients.
